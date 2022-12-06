@@ -1,6 +1,8 @@
+import asyncio
 import os
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
+from starknet_py.net.gateway_client import GatewayClient
 from starkware.cairo.common.hash_state import compute_hash_on_elements
 from starkware.cairo.lang.vm.crypto import pedersen_hash
 from starkware.crypto.signature.signature import sign
@@ -16,6 +18,7 @@ from starkware.starknet.core.os.transaction_hash.transaction_hash import (
 from starkware.starknet.public.abi import get_selector_from_name
 from starkware.starknet.services.api.contract_class import ContractClass
 from starkware.starknet.services.api.gateway.transaction import InvokeFunction
+from starkware.starkware_utils.error_handling import StarkErrorCode
 
 CONTRACT_ADDRESS_PREFIX = from_bytes(b"STARKNET_CONTRACT_ADDRESS")
 MAX_FEE = 3000000000000000
@@ -62,7 +65,7 @@ def get_address(
     constructor_calldata: Sequence[int],
     deployer_address: int = 0,
     compiled: bool = False,
-) -> int:
+):
 
     # Compile the account contract: must be in cairo environment
     # `compiled_account_contract` looks similar to "build/contract_compiled.json"
@@ -100,30 +103,28 @@ Move the appropriate amount of funds to the account. Then deploy the account.
 """
     )
 
-    return contract_address
 
-
-def sign_invoke_transaction(
-    contract_address: int,
+async def sign_invoke_transaction(
+    contract_address_to_invoke: int,
     function_name: str,
     calldata: Sequence[int],
     signer_address: int,
     private_key: Optional[int],
-    nonce: Optional[int] = 0,
     version: Optional[int] = 1,
     chain_id: int = TESTNET_ID,
     max_fee: Optional[int] = MAX_FEE,
-) -> InvokeFunction:
+    gateway_url: str = "https://alpha4-2.starknet.io",
+):
     """
     Given a function to invoke (contract address, selector, calldata) and the account contract's identifiers
     (signer address, possibly private key) prepares and signs an account invocation to this
     function. The transaction will connect to the Testnet automatically with the `chain_id` argument.
 
     Args:
-        contract_address (`int`):
+        contract_address_to_invoke (`int`):
             Address of the contract to be called by the signer.
-        selector (`int`):
-            Function selector to be called by the signer.
+        function_name (`str`):
+            Name of the function to be called. The selector will be obtained.
         calldata (`int`, *Sequence*):
             Calldata of the function to be called by the signer.
         signer_address (`int`):
@@ -132,12 +133,12 @@ def sign_invoke_transaction(
             If there is a private key for signing. Account abstraction allow us not to depend on a private key.
         max_fee (`int`):
             Max fee to be paid by the signerm contract for the transaction.
-        nonce (`int`, *optional*):
-            Nonce.
         version (`int`):
             Version.
         chain_id (`int`):
             Chain ID.
+        gateway_url (`str`):
+            Gateway to be used. Default is testnet 2: https://alpha4-2.starknet.io
     """
 
     data_offset = 0
@@ -145,7 +146,7 @@ def sign_invoke_transaction(
     data_len = len(calldata)
     # call_array follows the members of CallArray struct in our contract
     selector = get_selector_from_name(function_name)
-    call_array = [contract_address, selector, data_offset, data_len]
+    call_array = [contract_address_to_invoke, selector, data_offset, data_len]
     # call_array_len = 1, since we are only making a call
     call_array_len = 1
     calldata_len = len(calldata)
@@ -153,7 +154,12 @@ def sign_invoke_transaction(
     # call_array_len: felt, call_array: CallArray*, calldata_len: felt, calldata: felt*
     execute_calldata = [call_array_len, *call_array, calldata_len, *calldata]
 
-    print(f"Execute calldata: {execute_calldata}\n\n")
+    # Get account contract's nonce
+    account_contract_nonce = int(
+        os.popen(
+            f"starknet get_nonce --contract_address 0x{signer_address:064x} --feeder_gateway_url {gateway_url} --gateway_url {gateway_url} --network_id 1536727068981429685321"
+        ).read()
+    )
 
     # Calculates the transaction hash in the StarkNet network - a unique identifier of the transaction
     # This is valuable only if we need to sign the transaction
@@ -165,10 +171,8 @@ def sign_invoke_transaction(
         calldata=execute_calldata,
         max_fee=max_fee,
         chain_id=chain_id,
-        additional_data=[nonce],
+        additional_data=[account_contract_nonce],
     )
-
-    print(f"Transaction hash: {hash_value}\n")
 
     # If there is a private key then we sign the transaction
     if private_key is None:
@@ -181,18 +185,41 @@ def sign_invoke_transaction(
         contract_address=signer_address,
         calldata=execute_calldata,
         max_fee=max_fee,
-        nonce=nonce,
+        nonce=account_contract_nonce,
         signature=signature,
         version=version,
     )
 
-    return invoke_function
+    local_network_client = GatewayClient(gateway_url)
+
+    gateway_response = await local_network_client.send_transaction(invoke_function)
+
+    print(
+        f"""\
+Transaction hash: 0x{hash_value:064x}
+Status: {gateway_response.code}
+Deployed at: {gateway_url}
+Invoked contract address: 0x{contract_address_to_invoke:064x}
+Invoked function: {function_name} 
+Signer contract address: 0x{signer_address:064x}
+Signer contract nonce: {account_contract_nonce}
+
+If deployed in Goerli 2, review your transaction in the block explorer:
+https://testnet-2.starkscan.co/tx/0x{hash_value:064x}
+"""
+    )
 
 
-sign_invoke_transaction(
-    contract_address=0x07D960D57C020BE3BDDBA01FCE139800590BAF8E58B8ABDB7B45BDF518B0A16E,
-    function_name="admin",
-    calldata=[],
-    signer_address=0x2B0FC135CAE406BBC27766C189972DD3AAE5FC79A66D5191A8D6AC76A0CE8F9,
-    private_key=0x7398FB40A1C5B537D97D1E8ED9439B3A3807F02814DDF501C7521AB84E5B4A7,
-)
+## We make the invokations in the main code
+# async def main():
+
+#     await sign_invoke_transaction(
+#         contract_address_to_invoke=0x07D960D57C020BE3BDDBA01FCE139800590BAF8E58B8ABDB7B45BDF518B0A16E,
+#         function_name="get_voting_status",
+#         calldata=[],
+#         signer_address=0x2B0FC135CAE406BBC27766C189972DD3AAE5FC79A66D5191A8D6AC76A0CE8F9,
+#         private_key=0x7398FB40A1C5B537D97D1E8ED9439B3A3807F02814DDF501C7521AB84E5B4A7,
+#     )
+
+
+# asyncio.run(main())
